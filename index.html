@@ -174,13 +174,303 @@
   }
 
   async function joinRoom(){
-    const name=cleanName($("#nameInput").value),code=($("#roomInput").value||"").trim().toUpperCase();
-    if(!name){status($("#homeStatus"),"Type your name first.","bad");return}if(code.length!==6){status($("#homeStatus"),"Room code should be 6 characters.","bad");return}if(!uid)return;
-    const roomSnap=await get(ref(db,`rooms/${code}`));if(!roomSnap.exists()){status($("#homeStatus"),"That room does not exist.","bad");return}
-    const room=roomSnap.val();if(room.status==="playing"){status($("#homeStatus"),"That game already started. Ask the host to restart the round.","bad");return}
-    const count=Object.keys(room.players||{}).length;if(count>=6&&!room.players?.[uid]){status($("#homeStatus"),"Room is full (6 players max).","bad");return}
-    roomId=code;me={name};await set(ref(db,`rooms/${roomId}/players/${uid}`),{name,joinedAt:Date.now(),score:room.players?.[uid]?.score||0});watchRoom();
+  const name = cleanName($("#nameInput").value);
+  const code = ($("#roomInput").value || "").trim().toUpperCase();
+
+  if(!name){
+    status($("#homeStatus"), "Type your name first.", "bad");
+    return;
   }
+
+  if(code.length !== 6){
+    status($("#homeStatus"), "Room code should be 6 characters.", "bad");
+    return;
+  }
+
+  if(!uid) return;
+
+  status($("#homeStatus"), "Joining room…");
+
+  const roomRef = ref(db, `rooms/${code}`);
+  const roomSnap = await get(roomRef);
+
+  if(!roomSnap.exists()){
+    status($("#homeStatus"), "That room does not exist.", "bad");
+    return;
+  }
+
+  const existingRoom = roomSnap.val();
+  const normalizedName = name.toLowerCase();
+
+  // Look for an existing player with the same name.
+  // This allows someone who lost their connection to reclaim their seat.
+  const sameNameSeats = Object.entries(existingRoom.players || {})
+    .filter(([, p]) =>
+      String(p?.name || "").trim().toLowerCase() === normalizedName
+    );
+
+  const differentUidMatches = sameNameSeats.filter(
+    ([playerUid]) => playerUid !== uid
+  );
+
+  // Prevent confusion if two players used exactly the same name.
+  if(differentUidMatches.length > 1){
+    status(
+      $("#homeStatus"),
+      "More than one player has that name. Use a unique name such as Alex W.",
+      "bad"
+    );
+    return;
+  }
+
+  let outcome = "joined";
+  let failure = "";
+
+  const result = await runTransaction(roomRef, room => {
+
+    if(!room){
+      failure = "That room no longer exists.";
+      return;
+    }
+
+    room.players = room.players || {};
+
+    // ==========================================================
+    // CASE 1:
+    // Same Firebase UID reconnects.
+    // ==========================================================
+    if(room.players[uid]){
+
+      room.players[uid].name = name;
+      room.players[uid].lastSeenAt = Date.now();
+
+      outcome = "reconnected";
+
+      return room;
+    }
+
+    // ==========================================================
+    // CASE 2:
+    // Firebase gave the student a NEW UID.
+    //
+    // Find the old seat by player name and move everything
+    // belonging to the old UID onto the new UID.
+    // ==========================================================
+    const matches = Object.entries(room.players)
+      .filter(([playerUid, p]) =>
+        playerUid !== uid &&
+        String(p?.name || "").trim().toLowerCase() === normalizedName
+      );
+
+    if(matches.length === 1){
+
+      const [oldUid, oldPlayer] = matches[0];
+
+      // Restore player record.
+      room.players[uid] = {
+        ...oldPlayer,
+        name,
+        rejoinedAt: Date.now(),
+        lastSeenAt: Date.now()
+      };
+
+      delete room.players[oldUid];
+
+      // If this student was the host,
+      // transfer host privileges to the new UID.
+      if(room.hostUid === oldUid){
+        room.hostUid = uid;
+      }
+
+      // Restore live game data.
+      if(room.game){
+
+        room.game.hands = room.game.hands || {};
+
+        // Restore their cards.
+        if(
+          Object.prototype.hasOwnProperty.call(
+            room.game.hands,
+            oldUid
+          )
+        ){
+          room.game.hands[uid] =
+            room.game.hands[oldUid];
+
+          delete room.game.hands[oldUid];
+        }
+
+        // If it was their turn,
+        // transfer the turn to the new UID.
+        if(room.game.turnUid === oldUid){
+          room.game.turnUid = uid;
+        }
+
+        // Preserve winner information if necessary.
+        if(room.game.winner?.uid === oldUid){
+          room.game.winner.uid = uid;
+        }
+      }
+
+      outcome = "reclaimed";
+
+      return room;
+    }
+
+    if(matches.length > 1){
+      failure =
+        "More than one player has that name. Use a unique name.";
+
+      return;
+    }
+
+    // ==========================================================
+    // CASE 3:
+    // Completely new player.
+    // ==========================================================
+    const playerCount =
+      Object.keys(room.players).length;
+
+    if(playerCount >= 6){
+      failure =
+        "Room is full (6 players max).";
+
+      return;
+    }
+
+    // ==========================================================
+    // Normal lobby join
+    // ==========================================================
+    if(room.status !== "playing"){
+
+      room.players[uid] = {
+        name,
+        joinedAt: Date.now(),
+        lastSeenAt: Date.now(),
+        score: 0
+      };
+
+      outcome = "joined";
+
+      return room;
+    }
+
+    // ==========================================================
+    // GAME HAS ALREADY STARTED
+    //
+    // Allow a completely new player to join midway.
+    // ==========================================================
+
+    if(room.game?.winner){
+      failure =
+        "This round is already finished. Wait for the host to start the next round.";
+
+      return;
+    }
+
+    room.game = room.game || {};
+
+    // Firebase sometimes stores arrays like objects.
+    // Convert it safely back into an array.
+    room.game.deck = Array.isArray(room.game.deck)
+      ? room.game.deck
+      : Object.values(room.game.deck || {});
+
+    room.game.hands =
+      room.game.hands || {};
+
+    // A new player needs 5 cards.
+    if(room.game.deck.length < 5){
+
+      failure =
+        "Not enough cards remain for a new player to join this round.";
+
+      return;
+    }
+
+    const newHand = [];
+
+    for(let i = 0; i < 5; i++){
+      newHand.push(
+        room.game.deck.pop()
+      );
+    }
+
+    room.players[uid] = {
+      name,
+      joinedAt: Date.now(),
+      lastSeenAt: Date.now(),
+      score: 0,
+      joinedMidGame: true
+    };
+
+    room.game.hands[uid] =
+      newHand;
+
+    room.game.lastAction =
+      `${name} joined the game`;
+
+    outcome = "midgame";
+
+    return room;
+  });
+
+  // ==========================================================
+  // Transaction failed
+  // ==========================================================
+  if(!result.committed){
+
+    status(
+      $("#homeStatus"),
+      failure ||
+      "Could not join the room. Please try again.",
+      "bad"
+    );
+
+    return;
+  }
+
+  // ==========================================================
+  // Successful join/rejoin
+  // ==========================================================
+  roomId = code;
+  me = { name };
+
+  if(outcome === "reclaimed"){
+
+    status(
+      $("#homeStatus"),
+      "Reconnected — your seat and cards were restored.",
+      "good"
+    );
+
+  }else if(outcome === "midgame"){
+
+    status(
+      $("#homeStatus"),
+      "Joined the game — you received 5 cards.",
+      "good"
+    );
+
+  }else if(outcome === "reconnected"){
+
+    status(
+      $("#homeStatus"),
+      "Reconnected to the room.",
+      "good"
+    );
+
+  }else{
+
+    status(
+      $("#homeStatus"),
+      "Joined room.",
+      "good"
+    );
+  }
+
+  watchRoom();
+}
 
   function watchRoom(){if(roomUnsub)roomUnsub();roomUnsub=onValue(ref(db,`rooms/${roomId}`),snap=>{if(!snap.exists()){alert("Room closed.");location.reload();return}currentRoom=snap.val();render()})}
   function renderPlayers(target){target.innerHTML="";const turnUid=currentRoom?.game?.turnUid;for(const [id,p] of playerEntries(currentRoom)){const d=document.createElement("div");d.className="player"+(id===turnUid?" turn":"");d.innerHTML=`<div class="avatar">${(p.name||"?").slice(0,1).toUpperCase()}</div><div><b>${escapeHtml(p.name)}</b><small>${id===currentRoom.hostUid?"Host • ":""}${id===uid?"You":"Player"}${id===turnUid?" • TURN":""}</small></div>`;target.appendChild(d)}}
